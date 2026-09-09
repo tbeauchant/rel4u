@@ -1,0 +1,54 @@
+# Build directories and CMake files
+build/
+bin/
+lib/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+*.cmake
+!CMakeLists.txt
+
+# Ninja build files
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Compiled Object files, Libraries, and Executables
+*.o
+*.obj
+*.so
+*.so.*
+*.dylib
+*.dll
+*.a
+*.lib
+*.exe
+*.out
+*.app
+
+# Tooling & Language Server
+compile_commands.json
+.clangd/
+.cache/
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Agent files
+AGENT.md
+
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
