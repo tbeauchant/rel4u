@@ -287,6 +287,48 @@ static bool test_mpmc_dynamic_stress(void) {
     return true;
 }
 
+static bool test_mpmc_pop_wait_timeout_and_push_front(void) {
+    rel4u_mpmc_queue_t q;
+    ASSERT_EQ(rel4u_mpmc_init(&q, REL4U_MEM_FIXED, REL4U_QUEUE_FULL_DROP_NEW, 4, 0), 0);
+
+    rel4u_mpmc_item_t item;
+    // 1. Pop with short timeout on empty queue should return false
+    ASSERT_FALSE(rel4u_mpmc_pop_wait(&q, &item, 10));
+
+    // 2. Wake all on empty queue
+    rel4u_mpmc_wake_all(&q);
+
+    rel4u_mpmc_destroy(&q);
+
+    // 3. Test push_front in dynamic mode
+    size_t node_sz = sizeof(rel4u_mpmc_node_t);
+    size_t max_bytes = (node_sz + 16) * 4;
+    ASSERT_EQ(rel4u_mpmc_init(&q, REL4U_MEM_DYNAMIC, REL4U_QUEUE_FULL_DROP_NEW, 0, max_bytes), 0);
+
+    memset(&item, 0, sizeof(item));
+    item.len = 4;
+    item.client_id = 100;
+    ASSERT_TRUE(rel4u_mpmc_try_push(&q, &item));
+
+    item.client_id = 200;
+    ASSERT_TRUE(rel4u_mpmc_push_front(&q, &item));
+
+    // Pop first item -> should be 200 (pushed to front)
+    rel4u_mpmc_item_t popped;
+    ASSERT_TRUE(rel4u_mpmc_try_pop(&q, &popped));
+    ASSERT_EQ(popped.client_id, 200);
+
+    // Pop second item -> should be 100
+    ASSERT_TRUE(rel4u_mpmc_try_pop(&q, &popped));
+    ASSERT_EQ(popped.client_id, 100);
+
+    ASSERT_EQ(rel4u_mpmc_size(&q), 0);
+    ASSERT_EQ(rel4u_mpmc_bytes(&q), 0);
+
+    rel4u_mpmc_destroy(&q);
+    return true;
+}
+
 TEST_SUITE_BEGIN("Thread-Safe Bounded MPMC Queue Unit Tests")
     RUN_TEST(test_mpmc_basic);
     RUN_TEST(test_mpmc_fixed_drop_last);
@@ -294,4 +336,5 @@ TEST_SUITE_BEGIN("Thread-Safe Bounded MPMC Queue Unit Tests")
     RUN_TEST(test_mpmc_dynamic_drop_last);
     RUN_TEST(test_mpmc_multithreaded_stress);
     RUN_TEST(test_mpmc_dynamic_stress);
+    RUN_TEST(test_mpmc_pop_wait_timeout_and_push_front);
 TEST_SUITE_END()

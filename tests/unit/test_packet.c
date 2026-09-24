@@ -90,8 +90,45 @@ static bool test_packet_reset_codec(void) {
     return true;
 }
 
+static bool test_packet_codec_errors(void) {
+    rel4u_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = REL4U_MAGIC;
+    hdr.version = REL4U_VERSION;
+    hdr.packet_type = REL4U_PKT_DATA;
+    hdr.payload_len = 50;
+
+    uint8_t buffer[128];
+    // Encode buffer too small
+    ASSERT_EQ(rel4u_packet_encode_header(&hdr, buffer, REL4U_HEADER_LEN - 1), -1);
+    // NULL encode args
+    ASSERT_EQ(rel4u_packet_encode_header(NULL, buffer, sizeof(buffer)), -1);
+    ASSERT_EQ(rel4u_packet_encode_header(&hdr, NULL, sizeof(buffer)), -1);
+
+    // Encode valid packet
+    ASSERT_EQ(rel4u_packet_encode_header(&hdr, buffer, sizeof(buffer)), REL4U_HEADER_LEN);
+
+    rel4u_header_t decoded;
+    // Decode buffer too small (< REL4U_HEADER_LEN)
+    ASSERT_EQ(rel4u_packet_decode_header(buffer, REL4U_HEADER_LEN - 1, &decoded), -1);
+    // NULL decode args
+    ASSERT_EQ(rel4u_packet_decode_header(NULL, sizeof(buffer), &decoded), -1);
+    ASSERT_EQ(rel4u_packet_decode_header(buffer, sizeof(buffer), NULL), -1);
+
+    // Incomplete payload: declared 50 bytes, but only 20 provided after header
+    ASSERT_EQ(rel4u_packet_decode_header(buffer, REL4U_HEADER_LEN + 20, &decoded), -4);
+
+    // Invalid version
+    hdr.version = 99;
+    rel4u_packet_encode_header(&hdr, buffer, sizeof(buffer));
+    ASSERT_EQ(rel4u_packet_decode_header(buffer, REL4U_HEADER_LEN + 50, &decoded), -3);
+
+    return true;
+}
+
 TEST_SUITE_BEGIN("Packet Codec Unit Tests")
     RUN_TEST(test_packet_encode_decode);
     RUN_TEST(test_packet_reset_codec);
     RUN_TEST(test_packet_corrupt_rejection);
+    RUN_TEST(test_packet_codec_errors);
 TEST_SUITE_END()

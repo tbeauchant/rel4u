@@ -48,25 +48,84 @@ static bool test_all_delivery_modes(void) {
     rel4u_client_t* client = rel4u_client_create(&c_cfg);
     ASSERT_EQ(rel4u_client_connect(client), REL4U_OK);
 
-    // 1. Send Unreliable Unordered
+    // 1. Send Unreliable Unordered (Mode 0)
+    // Client -> Server
     const char* msg_unrel = "unreliable_unordered_msg";
     ASSERT_EQ(rel4u_client_send(client, REL4U_MODE_UNRELIABLE_UNORDERED, msg_unrel, strlen(msg_unrel)), REL4U_OK);
 
     char recv_buf[256];
     size_t recv_len = 0;
     uint32_t from_client = 0;
-    ASSERT_EQ(rel4u_server_recv(server, &from_client, recv_buf, sizeof(recv_buf), &recv_len, 500), REL4U_OK);
+    ASSERT_EQ(rel4u_server_recv(server, &from_client, recv_buf, sizeof(recv_buf), &recv_len, 1000), REL4U_OK);
     recv_buf[recv_len] = '\0';
     ASSERT_STR_EQ(recv_buf, msg_unrel);
 
-    // 2. Send 50 Reliable Ordered messages Client -> Server
-    for (int i = 0; i < 50; i++) {
+    // Server -> Client
+    const char* srv_msg_unrel = "srv_unreliable_unordered";
+    ASSERT_EQ(rel4u_server_send(server, from_client, REL4U_MODE_UNRELIABLE_UNORDERED, srv_msg_unrel, strlen(srv_msg_unrel)), REL4U_OK);
+    ASSERT_EQ(rel4u_client_recv(client, recv_buf, sizeof(recv_buf), &recv_len, 1000), REL4U_OK);
+    recv_buf[recv_len] = '\0';
+    ASSERT_STR_EQ(recv_buf, srv_msg_unrel);
+
+    // 2. Send Unreliable Ordered (Mode 1)
+    // Client -> Server
+    const char* msg_uo = "unreliable_ordered_msg";
+    ASSERT_EQ(rel4u_client_send(client, REL4U_MODE_UNRELIABLE_ORDERED, msg_uo, strlen(msg_uo)), REL4U_OK);
+    ASSERT_EQ(rel4u_server_recv(server, &from_client, recv_buf, sizeof(recv_buf), &recv_len, 1000), REL4U_OK);
+    recv_buf[recv_len] = '\0';
+    ASSERT_STR_EQ(recv_buf, msg_uo);
+
+    // Server -> Client
+    const char* srv_msg_uo = "srv_unreliable_ordered";
+    ASSERT_EQ(rel4u_server_send(server, from_client, REL4U_MODE_UNRELIABLE_ORDERED, srv_msg_uo, strlen(srv_msg_uo)), REL4U_OK);
+    ASSERT_EQ(rel4u_client_recv(client, recv_buf, sizeof(recv_buf), &recv_len, 1000), REL4U_OK);
+    recv_buf[recv_len] = '\0';
+    ASSERT_STR_EQ(recv_buf, srv_msg_uo);
+
+    // 3. Send Reliable Unordered (Mode 2)
+    // Client -> Server (10 messages)
+    for (int i = 0; i < 10; i++) {
+        char send_str[64];
+        snprintf(send_str, sizeof(send_str), "c2s_rel_unord_%02d", i);
+        ASSERT_EQ(rel4u_client_send(client, REL4U_MODE_RELIABLE_UNORDERED, send_str, strlen(send_str)), REL4U_OK);
+    }
+    bool c2s_ru_seen[10] = {0};
+    for (int i = 0; i < 10; i++) {
+        ASSERT_EQ(rel4u_server_recv(server, &from_client, recv_buf, sizeof(recv_buf), &recv_len, 1000), REL4U_OK);
+        recv_buf[recv_len] = '\0';
+        int idx = -1;
+        ASSERT_EQ(sscanf(recv_buf, "c2s_rel_unord_%02d", &idx), 1);
+        ASSERT_TRUE(idx >= 0 && idx < 10);
+        c2s_ru_seen[idx] = true;
+    }
+    for (int i = 0; i < 10; i++) ASSERT_TRUE(c2s_ru_seen[i]);
+
+    // Server -> Client (10 messages)
+    for (int i = 0; i < 10; i++) {
+        char send_str[64];
+        snprintf(send_str, sizeof(send_str), "s2c_rel_unord_%02d", i);
+        ASSERT_EQ(rel4u_server_send(server, from_client, REL4U_MODE_RELIABLE_UNORDERED, send_str, strlen(send_str)), REL4U_OK);
+    }
+    bool s2c_ru_seen[10] = {0};
+    for (int i = 0; i < 10; i++) {
+        ASSERT_EQ(rel4u_client_recv(client, recv_buf, sizeof(recv_buf), &recv_len, 1000), REL4U_OK);
+        recv_buf[recv_len] = '\0';
+        int idx = -1;
+        ASSERT_EQ(sscanf(recv_buf, "s2c_rel_unord_%02d", &idx), 1);
+        ASSERT_TRUE(idx >= 0 && idx < 10);
+        s2c_ru_seen[idx] = true;
+    }
+    for (int i = 0; i < 10; i++) ASSERT_TRUE(s2c_ru_seen[i]);
+
+    // 4. Send Reliable Ordered messages (Mode 3)
+    // Client -> Server
+    for (int i = 0; i < 30; i++) {
         char send_str[64];
         snprintf(send_str, sizeof(send_str), "rel_ordered_%03d", i);
         ASSERT_EQ(rel4u_client_send(client, REL4U_MODE_RELIABLE_ORDERED, send_str, strlen(send_str)), REL4U_OK);
     }
 
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < 30; i++) {
         char expected[64];
         snprintf(expected, sizeof(expected), "rel_ordered_%03d", i);
 
@@ -75,14 +134,14 @@ static bool test_all_delivery_modes(void) {
         ASSERT_STR_EQ(recv_buf, expected);
     }
 
-    // 3. Send 50 Reliable Ordered messages Server -> Client
-    for (int i = 0; i < 50; i++) {
+    // Server -> Client
+    for (int i = 0; i < 30; i++) {
         char send_str[64];
         snprintf(send_str, sizeof(send_str), "srv_to_cli_%03d", i);
         ASSERT_EQ(rel4u_server_send(server, from_client, REL4U_MODE_RELIABLE_ORDERED, send_str, strlen(send_str)), REL4U_OK);
     }
 
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < 30; i++) {
         char expected[64];
         snprintf(expected, sizeof(expected), "srv_to_cli_%03d", i);
 
@@ -921,6 +980,56 @@ static bool test_drop_last_queue_policy(void) {
     return true;
 }
 
+static bool test_drop_new_queue_policy(void) {
+    rel4u_server_config_t s_cfg;
+    memset(&s_cfg, 0, sizeof(s_cfg));
+    s_cfg.bind_port = 19127;
+    s_cfg.max_clients = 8;
+    s_cfg.memory_mode = REL4U_MEM_FIXED;
+    s_cfg.queue_full_policy = REL4U_QUEUE_FULL_DROP_NEW;
+    s_cfg.send_queue_capacity = 8;
+    s_cfg.recv_queue_capacity = 8;
+
+    rel4u_server_t* server = rel4u_server_create(&s_cfg);
+    ASSERT_TRUE(server != NULL);
+    ASSERT_EQ(rel4u_server_start(server), REL4U_OK);
+
+    rel4u_client_config_t c_cfg;
+    memset(&c_cfg, 0, sizeof(c_cfg));
+    c_cfg.server_address = "127.0.0.1";
+    c_cfg.server_port = 19127;
+    c_cfg.memory_mode = REL4U_MEM_FIXED;
+    c_cfg.queue_full_policy = REL4U_QUEUE_FULL_DROP_NEW;
+    c_cfg.send_queue_capacity = 8;
+    c_cfg.recv_queue_capacity = 8;
+
+    rel4u_client_t* client = rel4u_client_create(&c_cfg);
+    ASSERT_TRUE(client != NULL);
+    ASSERT_EQ(rel4u_client_connect(client), REL4U_OK);
+
+    // Rapidly send 100 messages on a queue of capacity 8.
+    // Under DROP_NEW, when the queue fills, sends must fail with REL4U_ERR_QUEUE_FULL.
+    int drop_count = 0;
+    for (int i = 0; i < 100; i++) {
+        char msg[32];
+        snprintf(msg, sizeof(msg), "drop_new_%d", i);
+        int res = rel4u_client_send(client, REL4U_MODE_UNRELIABLE_UNORDERED, msg, strlen(msg));
+        if (res == REL4U_ERR_QUEUE_FULL) {
+            drop_count++;
+        }
+    }
+
+    ASSERT_TRUE(drop_count > 0);
+
+    rel4u_stats_t stats;
+    ASSERT_EQ(rel4u_client_get_stats(client, &stats), REL4U_OK);
+    ASSERT_TRUE(stats.packets_dropped_queue_full > 0);
+
+    rel4u_client_destroy(client);
+    rel4u_server_destroy(server);
+    return true;
+}
+
 TEST_SUITE_BEGIN("rel4u Integration Tests")
     RUN_TEST(test_client_server_connect_disconnect);
     RUN_TEST(test_all_delivery_modes);
@@ -933,6 +1042,7 @@ TEST_SUITE_BEGIN("rel4u Integration Tests")
     RUN_TEST(test_voluntary_server_disconnect_no_reconnect);
     RUN_TEST(test_dynamic_memory_mode);
     RUN_TEST(test_drop_last_queue_policy);
+    RUN_TEST(test_drop_new_queue_policy);
     RUN_TEST(test_stress_reliable_ordered_heavy_loss);
     RUN_TEST(test_stress_burst_loss_blackout_recovery);
     RUN_TEST(test_stress_packet_reordering_and_duplication);

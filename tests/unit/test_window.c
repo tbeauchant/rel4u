@@ -180,10 +180,85 @@ static bool test_window_reset_and_reclaim(void) {
     return true;
 }
 
+static bool test_send_window_full_and_exhaustion(void) {
+    rel4u_send_window_t win;
+    ASSERT_EQ(rel4u_send_window_init(&win, 4, 10), 0);
+
+    ASSERT_TRUE(rel4u_send_window_can_send(&win));
+
+    uint32_t seq;
+    // Push 4 reliable packets to saturate capacity
+    for (int i = 0; i < 4; i++) {
+        ASSERT_EQ(rel4u_send_window_push(&win, REL4U_MODE_RELIABLE_ORDERED, "data", 4, 1000, &seq), 0);
+        ASSERT_EQ(seq, 10 + (uint32_t)i);
+    }
+
+    // Window must be full
+    ASSERT_FALSE(rel4u_send_window_can_send(&win));
+
+    // 5th reliable push must fail with -2 (window full)
+    ASSERT_EQ(rel4u_send_window_push(&win, REL4U_MODE_RELIABLE_ORDERED, "data", 4, 1000, &seq), -2);
+
+    // Unreliable packet does not consume window slot and should succeed
+    ASSERT_EQ(rel4u_send_window_push(&win, REL4U_MODE_UNRELIABLE_UNORDERED, "unrel", 5, 1000, &seq), 0);
+
+    // ACK packet 10 to free 1 slot
+    rel4u_send_window_on_ack(&win, 10, 0, 2000, NULL, NULL);
+    ASSERT_EQ(win.in_flight, 3);
+    ASSERT_TRUE(rel4u_send_window_can_send(&win));
+
+    // Now pushing reliable packet succeeds
+    ASSERT_EQ(rel4u_send_window_push(&win, REL4U_MODE_RELIABLE_ORDERED, "data", 4, 2000, &seq), 0);
+    ASSERT_EQ(seq, 14);
+
+    rel4u_send_window_destroy(&win);
+    return true;
+}
+
+static bool test_recv_window_duplicate_and_capacity(void) {
+    rel4u_recv_window_t win;
+    ASSERT_EQ(rel4u_recv_window_init(&win, 8, 50), 0);
+
+    rel4u_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.delivery_mode = REL4U_MODE_RELIABLE_ORDERED;
+    hdr.payload_len = 4;
+
+    rel4u_recv_slot_t ready[8];
+    size_t ready_count = 0;
+
+    // 1. In-order packet 50
+    hdr.seq_num = 50;
+    ASSERT_EQ(rel4u_recv_window_on_packet(&win, &hdr, (const uint8_t*)"p050", ready, 8, &ready_count), 0);
+    ASSERT_EQ(ready_count, 1);
+    ASSERT_EQ(win.expected_seq, 51);
+
+    // 2. Duplicate of already delivered packet 50 -> must return 1 (drop)
+    ASSERT_EQ(rel4u_recv_window_on_packet(&win, &hdr, (const uint8_t*)"p050", ready, 8, &ready_count), 1);
+    ASSERT_EQ(ready_count, 0);
+
+    // 3. Out-of-order packet 53 (within capacity 8, expected is 51, diff 2)
+    hdr.seq_num = 53;
+    ASSERT_EQ(rel4u_recv_window_on_packet(&win, &hdr, (const uint8_t*)"p053", ready, 8, &ready_count), 0);
+    ASSERT_EQ(ready_count, 0);
+
+    // 4. Duplicate of buffered out-of-order packet 53 -> must return 1 (drop)
+    ASSERT_EQ(rel4u_recv_window_on_packet(&win, &hdr, (const uint8_t*)"p053", ready, 8, &ready_count), 1);
+
+    // 5. Packet beyond capacity (expected is 51, packet is 60: diff = 9 >= capacity 8)
+    hdr.seq_num = 60;
+    ASSERT_EQ(rel4u_recv_window_on_packet(&win, &hdr, (const uint8_t*)"p060", ready, 8, &ready_count), -2);
+
+    rel4u_recv_window_destroy(&win);
+    return true;
+}
+
 TEST_SUITE_BEGIN("Sliding Window & SACK Unit Tests")
     RUN_TEST(test_sequence_math);
     RUN_TEST(test_send_window_and_sack);
     RUN_TEST(test_recv_window_reassembly_and_sack);
     RUN_TEST(test_unreliable_ordered_mode);
     RUN_TEST(test_window_reset_and_reclaim);
+    RUN_TEST(test_send_window_full_and_exhaustion);
+    RUN_TEST(test_recv_window_duplicate_and_capacity);
 TEST_SUITE_END()
