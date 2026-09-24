@@ -966,12 +966,13 @@ static bool test_drop_last_queue_policy(void) {
     ASSERT_TRUE(client != NULL);
     ASSERT_EQ(rel4u_client_connect(client), REL4U_OK);
 
-    // Rapidly send 50 messages, which far exceeds send_queue_capacity (8)
+    // Rapidly send 1000 messages without string-formatting overhead,
+    // which overwhelmingly exceeds send_queue_capacity (8) across all OS schedulers.
     // Under DROP_LAST, send should never return REL4U_ERR_QUEUE_FULL because oldest are evicted.
-    for (int i = 0; i < 50; i++) {
-        char msg[32];
-        snprintf(msg, sizeof(msg), "msg_%d", i);
-        int res = rel4u_client_send(client, REL4U_MODE_UNRELIABLE_UNORDERED, msg, strlen(msg));
+    const char* msg_drop_last = "msg_drop_last_payload";
+    size_t msg_len = strlen(msg_drop_last);
+    for (int i = 0; i < 1000; i++) {
+        int res = rel4u_client_send(client, REL4U_MODE_UNRELIABLE_UNORDERED, msg_drop_last, msg_len);
         ASSERT_EQ(res, REL4U_OK);
     }
 
@@ -1013,13 +1014,13 @@ static bool test_drop_new_queue_policy(void) {
     ASSERT_TRUE(client != NULL);
     ASSERT_EQ(rel4u_client_connect(client), REL4U_OK);
 
-    // Rapidly send 100 messages on a queue of capacity 8.
+    // Rapidly send 1000 messages on a queue of capacity 8 without string formatting.
     // Under DROP_NEW, when the queue fills, sends must fail with REL4U_ERR_QUEUE_FULL.
+    const char* msg_drop_new = "msg_drop_new_payload";
+    size_t new_len = strlen(msg_drop_new);
     int drop_count = 0;
-    for (int i = 0; i < 100; i++) {
-        char msg[32];
-        snprintf(msg, sizeof(msg), "drop_new_%d", i);
-        int res = rel4u_client_send(client, REL4U_MODE_UNRELIABLE_UNORDERED, msg, strlen(msg));
+    for (int i = 0; i < 1000; i++) {
+        int res = rel4u_client_send(client, REL4U_MODE_UNRELIABLE_UNORDERED, msg_drop_new, new_len);
         if (res == REL4U_ERR_QUEUE_FULL) {
             drop_count++;
         }
