@@ -7,6 +7,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 # Compiler Warnings & Flags
 if(MSVC)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     add_compile_options(/W4 /WX /permissive- /experimental:c11atomics)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter)

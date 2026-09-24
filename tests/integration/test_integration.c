@@ -1,3 +1,9 @@
+#ifdef _MSC_VER
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#endif
+
 #include "../framework/test_framework.h"
 #include "../../include/rel4u.h"
 #include "../../src/platform/rel4u_time.h"
