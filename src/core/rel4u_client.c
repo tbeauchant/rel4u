@@ -16,9 +16,11 @@ struct rel4u_client {
     rel4u_net_addr_t      server_addr;
     rel4u_wakeup_pipe_t   wakeup_pipe;
     rel4u_thread_t        worker_thread;
+    bool                  worker_started;
     atomic_bool           running;
     atomic_int            state;          /* rel4u_conn_state_t */
     uint32_t              session_id;
+    bool                  rejected;
 
     rel4u_mpmc_queue_t    send_queue;
     rel4u_mpmc_queue_t    recv_queue;
@@ -100,15 +102,26 @@ rel4u_client_t* rel4u_client_create(const rel4u_client_config_t* config) {
 
 int rel4u_client_connect(rel4u_client_t* c) {
     if (!c) return REL4U_ERR_INVALID_PARAM;
-    if (atomic_load(&c->state) != REL4U_STATE_DISCONNECTED) {
-        return REL4U_OK; /* Already connecting or connected */
+    if (atomic_load(&c->state) == REL4U_STATE_CONNECTED) {
+        return REL4U_OK; /* Already connected */
     }
+
+    /* Clean up any existing connection attempt or terminated worker thread */
+    rel4u_client_disconnect(c);
 
     rel4u_net_init();
 
     if (rel4u_net_addr_from_string(&c->server_addr, c->config.server_address, c->config.server_port) != 0) {
         return REL4U_ERR_INVALID_PARAM;
     }
+
+    /* Reset windows, RTT, and session state before new connection attempt */
+    rel4u_send_window_reset(&c->send_win, 1);
+    rel4u_recv_window_reset(&c->recv_win, 1);
+    rel4u_rtt_init(&c->rtt, REL4U_RTT_DEFAULT_RTO_MS, REL4U_RTT_MIN_RTO_MS, REL4U_RTT_MAX_RTO_MS);
+    c->session_id = 0;
+    c->ack_pending = false;
+    c->rejected = false;
 
     c->sock = rel4u_net_socket_create_udp(c->server_addr.addr.ss_family == AF_INET6);
     if (c->sock == REL4U_INVALID_SOCKET) {
@@ -139,6 +152,7 @@ int rel4u_client_connect(rel4u_client_t* c) {
         c->sock = REL4U_INVALID_SOCKET;
         return REL4U_ERR_SYSTEM;
     }
+    c->worker_started = true;
 
     /* Wait for connection to establish or timeout */
     uint64_t start_ms = rel4u_time_now_ms();
@@ -148,7 +162,9 @@ int rel4u_client_connect(rel4u_client_t* c) {
             return REL4U_OK;
         }
         if (state == REL4U_STATE_DISCONNECTED) {
-            return REL4U_ERR_NOT_CONNECTED;
+            bool was_rejected = c->rejected;
+            rel4u_client_disconnect(c);
+            return was_rejected ? REL4U_ERR_SERVER_FULL : REL4U_ERR_NOT_CONNECTED;
         }
         if (rel4u_time_now_ms() - start_ms >= c->config.connect_timeout_ms) {
             rel4u_client_disconnect(c);
@@ -157,37 +173,57 @@ int rel4u_client_connect(rel4u_client_t* c) {
         rel4u_time_sleep_ms(10);
     }
 
-    return REL4U_ERR_NOT_CONNECTED;
+    bool was_rejected = c->rejected;
+    rel4u_client_disconnect(c);
+    return was_rejected ? REL4U_ERR_SERVER_FULL : REL4U_ERR_NOT_CONNECTED;
 }
 
 int rel4u_client_disconnect(rel4u_client_t* c) {
     if (!c) return REL4U_ERR_INVALID_PARAM;
-    if (!atomic_load(&c->running)) return REL4U_OK;
+    if (!c->worker_started) {
+        if (c->sock != REL4U_INVALID_SOCKET) {
+            rel4u_net_socket_close(c->sock);
+            c->sock = REL4U_INVALID_SOCKET;
+        }
+        atomic_store(&c->state, REL4U_STATE_DISCONNECTED);
+        return REL4U_OK;
+    }
 
-    atomic_store(&c->state, REL4U_STATE_DISCONNECTING);
-    rel4u_wakeup_pipe_signal(&c->wakeup_pipe);
+    if (atomic_load(&c->running)) {
+        atomic_store(&c->state, REL4U_STATE_DISCONNECTING);
+        rel4u_wakeup_pipe_signal(&c->wakeup_pipe);
 
-    /* Send FIN packet */
-    rel4u_header_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.magic = REL4U_MAGIC;
-    hdr.version = REL4U_VERSION;
-    hdr.packet_type = REL4U_PKT_DISCONNECT;
-    hdr.session_id = c->session_id;
+        /* Send FIN packet */
+        rel4u_header_t hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.magic = REL4U_MAGIC;
+        hdr.version = REL4U_VERSION;
+        hdr.packet_type = REL4U_PKT_DISCONNECT;
+        hdr.session_id = c->session_id;
 
-    uint8_t buf[REL4U_HEADER_LEN];
-    rel4u_packet_encode_header(&hdr, buf, sizeof(buf));
-    rel4u_net_sendto(c->sock, buf, sizeof(buf), &c->server_addr);
+        uint8_t buf[REL4U_HEADER_LEN];
+        rel4u_packet_encode_header(&hdr, buf, sizeof(buf));
+        rel4u_net_sendto(c->sock, buf, sizeof(buf), &c->server_addr);
 
-    atomic_store(&c->running, false);
-    rel4u_wakeup_pipe_signal(&c->wakeup_pipe);
+        atomic_store(&c->running, false);
+        rel4u_wakeup_pipe_signal(&c->wakeup_pipe);
+    }
+
     rel4u_mpmc_wake_all(&c->recv_queue);
     rel4u_thread_join(c->worker_thread);
+    c->worker_started = false;
 
     rel4u_wakeup_pipe_close(&c->wakeup_pipe);
     rel4u_net_socket_close(c->sock);
     c->sock = REL4U_INVALID_SOCKET;
     atomic_store(&c->state, REL4U_STATE_DISCONNECTED);
+
+    /* Reset windows, RTT, and session state */
+    rel4u_send_window_reset(&c->send_win, 1);
+    rel4u_recv_window_reset(&c->recv_win, 1);
+    rel4u_rtt_init(&c->rtt, REL4U_RTT_DEFAULT_RTO_MS, REL4U_RTT_MIN_RTO_MS, REL4U_RTT_MAX_RTO_MS);
+    c->session_id = 0;
+    c->ack_pending = false;
 
     return REL4U_OK;
 }
@@ -284,7 +320,7 @@ static void client_send_packet(rel4u_client_t* c, rel4u_pkt_type_t type, rel4u_d
 
     rel4u_recv_window_get_ack_info(&c->recv_win, &hdr.ack_num, &hdr.sack_mask);
 
-    uint8_t raw_buf[REL4U_DEFAULT_MTU];
+    uint8_t raw_buf[REL4U_MAX_PAYLOAD_SIZE + REL4U_HEADER_LEN];
     int hdr_len = rel4u_packet_encode_header(&hdr, raw_buf, sizeof(raw_buf));
     if (hdr_len <= 0) return;
 
@@ -323,7 +359,7 @@ static void client_trigger_reconnect(rel4u_client_t* c) {
 
 static void* client_worker_thread_func(void* arg) {
     rel4u_client_t* c = (rel4u_client_t*)arg;
-    uint8_t in_buf[REL4U_DEFAULT_MTU];
+    uint8_t in_buf[REL4U_MAX_PAYLOAD_SIZE + REL4U_HEADER_LEN];
     rel4u_recv_slot_t ready_slots[64];
 
     c->last_activity_ns = rel4u_time_now_ns();
@@ -394,8 +430,15 @@ static void* client_worker_thread_func(void* arg) {
                 }
 
                 /* Voluntary Disconnect / Server Reject: Permanently disconnect without auto-reconnecting */
-                if (hdr.packet_type == REL4U_PKT_REJECT || hdr.packet_type == REL4U_PKT_DISCONNECT) {
+                if (hdr.packet_type == REL4U_PKT_REJECT) {
+                    c->rejected = true;
                     atomic_store(&c->state, REL4U_STATE_DISCONNECTED);
+                    atomic_store(&c->running, false);
+                    break;
+                }
+                if (hdr.packet_type == REL4U_PKT_DISCONNECT) {
+                    atomic_store(&c->state, REL4U_STATE_DISCONNECTED);
+                    atomic_store(&c->running, false);
                     break;
                 }
 
@@ -426,6 +469,32 @@ static void* client_worker_thread_func(void* arg) {
                             item.len = ready_slots[k].payload_len;
                             memcpy(item.data, ready_slots[k].payload, item.len);
                             rel4u_mpmc_push_notify(&c->recv_queue, &item);
+                        }
+                        while (ready_count == 64 &&
+                               rel4u_recv_window_pop_ready(&c->recv_win, ready_slots, 64, &ready_count) == 0 &&
+                               ready_count > 0) {
+                            for (size_t k = 0; k < ready_count; k++) {
+                                rel4u_mpmc_item_t item;
+                                item.client_id = 0;
+                                item.mode = ready_slots[k].delivery_mode;
+                                item.len = ready_slots[k].payload_len;
+                                memcpy(item.data, ready_slots[k].payload, item.len);
+                                rel4u_mpmc_push_notify(&c->recv_queue, &item);
+                            }
+                        }
+                        c->ack_pending = true;
+                    } else if (res == 1) {
+                        /* Retransmission or duplicate: pop any ready packets and update ACK */
+                        while (rel4u_recv_window_pop_ready(&c->recv_win, ready_slots, 64, &ready_count) == 0 &&
+                               ready_count > 0) {
+                            for (size_t k = 0; k < ready_count; k++) {
+                                rel4u_mpmc_item_t item;
+                                item.client_id = 0;
+                                item.mode = ready_slots[k].delivery_mode;
+                                item.len = ready_slots[k].payload_len;
+                                memcpy(item.data, ready_slots[k].payload, item.len);
+                                rel4u_mpmc_push_notify(&c->recv_queue, &item);
+                            }
                         }
                         c->ack_pending = true;
                     }

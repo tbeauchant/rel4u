@@ -7,7 +7,7 @@
 #include "rel4u.h"
 #include "../platform/rel4u_threads.h"
 
-#define REL4U_MAX_MSG_SIZE 2048
+#define REL4U_MAX_MSG_SIZE 9216
 
 typedef struct rel4u_mpmc_item {
     uint32_t client_id;

@@ -26,6 +26,9 @@ struct rel4u_server {
     rel4u_mutex_t          table_mutex;
     rel4u_mutex_t          stats_mutex;
     rel4u_stats_t          stats;
+
+    rel4u_mpmc_item_t      pending_item;
+    bool                   has_pending_item;
 };
 
 static void* server_worker_thread_func(void* arg);
@@ -272,7 +275,7 @@ static void server_send_packet(rel4u_server_t* s, rel4u_client_session_t* sessio
 
     rel4u_recv_window_get_ack_info(&session->recv_win, &hdr.ack_num, &hdr.sack_mask);
 
-    uint8_t raw_buf[REL4U_DEFAULT_MTU];
+    uint8_t raw_buf[REL4U_MAX_PAYLOAD_SIZE + REL4U_HEADER_LEN];
     int hdr_len = rel4u_packet_encode_header(&hdr, raw_buf, sizeof(raw_buf));
     if (hdr_len <= 0) return;
 
@@ -298,7 +301,7 @@ static void server_send_packet(rel4u_server_t* s, rel4u_client_session_t* sessio
 
 static void* server_worker_thread_func(void* arg) {
     rel4u_server_t* s = (rel4u_server_t*)arg;
-    uint8_t in_buf[REL4U_DEFAULT_MTU];
+    uint8_t in_buf[REL4U_MAX_PAYLOAD_SIZE + REL4U_HEADER_LEN];
     rel4u_recv_slot_t ready_slots[64];
 
     while (atomic_load(&s->running)) {
@@ -388,9 +391,13 @@ static void* server_worker_thread_func(void* arg) {
                 session->stats.packets_recv++;
                 session->stats.bytes_recv += (uint64_t)bytes_read;
 
+                /* If session is in CONNECTING state and we received any valid packet for it, promote to CONNECTED */
+                if (session->state == REL4U_STATE_CONNECTING) {
+                    session->state = REL4U_STATE_CONNECTED;
+                }
+
                 /* Handle Connection ACK */
                 if (hdr.packet_type == REL4U_PKT_CONNECT_ACK) {
-                    session->state = REL4U_STATE_CONNECTED;
                     rel4u_mutex_unlock(&s->table_mutex);
                     continue;
                 }
@@ -425,6 +432,32 @@ static void* server_worker_thread_func(void* arg) {
                             memcpy(item.data, ready_slots[k].payload, item.len);
                             rel4u_mpmc_push_notify(&s->recv_queue, &item);
                         }
+                        while (ready_count == 64 &&
+                               rel4u_recv_window_pop_ready(&session->recv_win, ready_slots, 64, &ready_count) == 0 &&
+                               ready_count > 0) {
+                            for (size_t k = 0; k < ready_count; k++) {
+                                rel4u_mpmc_item_t item;
+                                item.client_id = session->client_id;
+                                item.mode = ready_slots[k].delivery_mode;
+                                item.len = ready_slots[k].payload_len;
+                                memcpy(item.data, ready_slots[k].payload, item.len);
+                                rel4u_mpmc_push_notify(&s->recv_queue, &item);
+                            }
+                        }
+                        session->ack_pending = true;
+                    } else if (res == 1) {
+                        /* Retransmission or duplicate: pop any ready packets and update ACK */
+                        while (rel4u_recv_window_pop_ready(&session->recv_win, ready_slots, 64, &ready_count) == 0 &&
+                               ready_count > 0) {
+                            for (size_t k = 0; k < ready_count; k++) {
+                                rel4u_mpmc_item_t item;
+                                item.client_id = session->client_id;
+                                item.mode = ready_slots[k].delivery_mode;
+                                item.len = ready_slots[k].payload_len;
+                                memcpy(item.data, ready_slots[k].payload, item.len);
+                                rel4u_mpmc_push_notify(&s->recv_queue, &item);
+                            }
+                        }
                         session->ack_pending = true;
                     }
                 }
@@ -434,30 +467,27 @@ static void* server_worker_thread_func(void* arg) {
         }
 
         /* 3. Drain Outbound Send Queue with Window Flow Control */
-        static rel4u_mpmc_item_t pending_item;
-        static bool has_pending_item = false;
-
         while (true) {
-            if (!has_pending_item) {
-                if (!rel4u_mpmc_try_pop(&s->send_queue, &pending_item)) {
+            if (!s->has_pending_item) {
+                if (!rel4u_mpmc_try_pop(&s->send_queue, &s->pending_item)) {
                     break; /* Queue empty */
                 }
-                has_pending_item = true;
+                s->has_pending_item = true;
             }
 
             rel4u_mutex_lock(&s->table_mutex);
-            rel4u_client_session_t* session = rel4u_session_find_by_id(&s->session_table, pending_item.client_id);
+            rel4u_client_session_t* session = rel4u_session_find_by_id(&s->session_table, s->pending_item.client_id);
             if (session && session->state == REL4U_STATE_CONNECTED) {
                 if (rel4u_send_window_can_send(&session->send_win)) {
                     uint32_t seq = 0;
                     now_ns = rel4u_time_now_ns();
-                    int push_res = rel4u_send_window_push(&session->send_win, (rel4u_delivery_mode_t)pending_item.mode,
-                                                          pending_item.data, pending_item.len, now_ns, &seq);
+                    int push_res = rel4u_send_window_push(&session->send_win, (rel4u_delivery_mode_t)s->pending_item.mode,
+                                                          s->pending_item.data, s->pending_item.len, now_ns, &seq);
                     if (push_res == 0) {
-                        server_send_packet(s, session, REL4U_PKT_DATA, (rel4u_delivery_mode_t)pending_item.mode,
-                                           seq, pending_item.data, pending_item.len);
+                        server_send_packet(s, session, REL4U_PKT_DATA, (rel4u_delivery_mode_t)s->pending_item.mode,
+                                           seq, s->pending_item.data, s->pending_item.len);
                     }
-                    has_pending_item = false; /* Successfully sent */
+                    s->has_pending_item = false; /* Successfully sent */
                     rel4u_mutex_unlock(&s->table_mutex);
                 } else {
                     /* Window full for this client, pause drain until ACKs advance window */
@@ -466,7 +496,7 @@ static void* server_worker_thread_func(void* arg) {
                 }
             } else {
                 /* Client disconnected / invalid, discard item */
-                has_pending_item = false;
+                s->has_pending_item = false;
                 rel4u_mutex_unlock(&s->table_mutex);
             }
         }

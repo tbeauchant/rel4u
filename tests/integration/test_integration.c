@@ -32,6 +32,19 @@ static bool test_client_server_connect_disconnect(void) {
     ASSERT_EQ(rel4u_client_connect(client), REL4U_OK);
     ASSERT_EQ(rel4u_client_get_state(client), REL4U_STATE_CONNECTED);
 
+    rel4u_stats_t s_stats;
+    ASSERT_EQ(rel4u_server_get_stats(server, &s_stats), REL4U_OK);
+    ASSERT_EQ(s_stats.active_connections, 1);
+
+    /* Explicit disconnect */
+    ASSERT_EQ(rel4u_client_disconnect(client), REL4U_OK);
+    ASSERT_EQ(rel4u_client_get_state(client), REL4U_STATE_DISCONNECTED);
+
+    /* Allow server worker thread to process FIN datagram */
+    rel4u_time_sleep_ms(50);
+    ASSERT_EQ(rel4u_server_get_stats(server, &s_stats), REL4U_OK);
+    ASSERT_EQ(s_stats.active_connections, 0);
+
     rel4u_client_destroy(client);
     rel4u_server_destroy(server);
     return true;
@@ -237,9 +250,9 @@ static bool test_server_max_clients_rejection(void) {
     ASSERT_EQ(rel4u_client_connect(c1), REL4U_OK);
     ASSERT_EQ(rel4u_client_connect(c2), REL4U_OK);
 
-    // 3rd client should fail to connect (server full)
+    // 3rd client should fail to connect with exact contract error REL4U_ERR_SERVER_FULL
     int res = rel4u_client_connect(c3);
-    ASSERT_TRUE(res != REL4U_OK);
+    ASSERT_EQ(res, REL4U_ERR_SERVER_FULL);
 
     rel4u_client_destroy(c1);
     rel4u_client_destroy(c2);
@@ -272,14 +285,31 @@ static bool test_server_max_clients_lru_eviction(void) {
     rel4u_time_sleep_ms(10);
     ASSERT_EQ(rel4u_client_connect(c2), REL4U_OK);
 
-    // Touch c2 so c1 is the least recently active (LRU)
-    const char* msg = "touch";
-    rel4u_client_send(c2, REL4U_MODE_UNRELIABLE_UNORDERED, msg, strlen(msg));
+    // Touch c1 so c2 is the least recently active (LRU)
+    const char* msg = "touch_c1";
+    ASSERT_EQ(rel4u_client_send(c1, REL4U_MODE_UNRELIABLE_UNORDERED, msg, strlen(msg)), REL4U_OK);
     rel4u_time_sleep_ms(50);
+    char tbuf[64]; size_t tlen; uint32_t tcid;
+    ASSERT_EQ(rel4u_server_recv(server, &tcid, tbuf, sizeof(tbuf), &tlen, 1000), REL4U_OK);
 
-    // Now connect c3: c1 should be evicted and c3 admitted!
+    // Now connect c3: c2 should be evicted and c3 admitted!
     ASSERT_EQ(rel4u_client_connect(c3), REL4U_OK);
     ASSERT_EQ(rel4u_client_get_state(c3), REL4U_STATE_CONNECTED);
+
+    // c1 is still connected and can send
+    const char* m1 = "msg_from_c1";
+    ASSERT_EQ(rel4u_client_send(c1, REL4U_MODE_RELIABLE_ORDERED, m1, strlen(m1)), REL4U_OK);
+    char buf[64]; size_t len; uint32_t cid;
+    ASSERT_EQ(rel4u_server_recv(server, &cid, buf, sizeof(buf), &len, 1000), REL4U_OK);
+    buf[len] = '\0';
+    ASSERT_STR_EQ(buf, m1);
+
+    // c3 is connected and can send
+    const char* m3 = "msg_from_c3";
+    ASSERT_EQ(rel4u_client_send(c3, REL4U_MODE_RELIABLE_ORDERED, m3, strlen(m3)), REL4U_OK);
+    ASSERT_EQ(rel4u_server_recv(server, &cid, buf, sizeof(buf), &len, 1000), REL4U_OK);
+    buf[len] = '\0';
+    ASSERT_STR_EQ(buf, m3);
 
     rel4u_client_destroy(c1);
     rel4u_client_destroy(c2);
@@ -1037,6 +1067,386 @@ static bool test_drop_new_queue_policy(void) {
     return true;
 }
 
+static bool test_regression_large_mtu_support(void) {
+    rel4u_server_config_t s_cfg;
+    memset(&s_cfg, 0, sizeof(s_cfg));
+    s_cfg.bind_port = 19130;
+    s_cfg.max_clients = 4;
+    s_cfg.mtu = 2000;
+
+    rel4u_server_t* server = rel4u_server_create(&s_cfg);
+    ASSERT_TRUE(server != NULL);
+    ASSERT_EQ(rel4u_server_start(server), REL4U_OK);
+
+    rel4u_client_config_t c_cfg;
+    memset(&c_cfg, 0, sizeof(c_cfg));
+    c_cfg.server_address = "127.0.0.1";
+    c_cfg.server_port = 19130;
+    c_cfg.mtu = 2000;
+
+    rel4u_client_t* client = rel4u_client_create(&c_cfg);
+    ASSERT_TRUE(client != NULL);
+    ASSERT_EQ(rel4u_client_connect(client), REL4U_OK);
+
+    /* Send payload of 1800 bytes (> 1400 default MTU, <= 2000 - 24) */
+    static char big_payload[1800];
+    for (size_t i = 0; i < sizeof(big_payload); i++) {
+        big_payload[i] = (char)('A' + (i % 26));
+    }
+
+    ASSERT_EQ(rel4u_client_send(client, REL4U_MODE_RELIABLE_ORDERED, big_payload, sizeof(big_payload)), REL4U_OK);
+
+    static char recv_buf[2048];
+    size_t recv_len = 0;
+    uint32_t cid = 0;
+    ASSERT_EQ(rel4u_server_recv(server, &cid, recv_buf, sizeof(recv_buf), &recv_len, 2000), REL4U_OK);
+    ASSERT_EQ(recv_len, sizeof(big_payload));
+    ASSERT_EQ(memcmp(recv_buf, big_payload, sizeof(big_payload)), 0);
+
+    /* Echo back server -> client */
+    ASSERT_EQ(rel4u_server_send(server, cid, REL4U_MODE_RELIABLE_ORDERED, big_payload, sizeof(big_payload)), REL4U_OK);
+    ASSERT_EQ(rel4u_client_recv(client, recv_buf, sizeof(recv_buf), &recv_len, 2000), REL4U_OK);
+    ASSERT_EQ(recv_len, sizeof(big_payload));
+    ASSERT_EQ(memcmp(recv_buf, big_payload, sizeof(big_payload)), 0);
+
+    rel4u_client_destroy(client);
+    rel4u_server_destroy(server);
+    return true;
+}
+
+static bool test_regression_rejected_client_cleanup(void) {
+    rel4u_server_config_t s_cfg;
+    memset(&s_cfg, 0, sizeof(s_cfg));
+    s_cfg.bind_port = 19131;
+    s_cfg.max_clients = 1;
+    s_cfg.full_policy = REL4U_MAX_CLIENTS_REJECT;
+
+    rel4u_server_t* server = rel4u_server_create(&s_cfg);
+    ASSERT_TRUE(server != NULL);
+    ASSERT_EQ(rel4u_server_start(server), REL4U_OK);
+
+    rel4u_client_config_t c_cfg;
+    memset(&c_cfg, 0, sizeof(c_cfg));
+    c_cfg.server_address = "127.0.0.1";
+    c_cfg.server_port = 19131;
+    c_cfg.connect_timeout_ms = 800;
+
+    rel4u_client_t* c1 = rel4u_client_create(&c_cfg);
+    rel4u_client_t* c2 = rel4u_client_create(&c_cfg);
+
+    ASSERT_EQ(rel4u_client_connect(c1), REL4U_OK);
+
+    /* c2 connect rejected because server is full */
+    int res = rel4u_client_connect(c2);
+    ASSERT_EQ(res, REL4U_ERR_SERVER_FULL);
+    ASSERT_EQ(rel4u_client_get_state(c2), REL4U_STATE_DISCONNECTED);
+
+    /* Disconnect c1 to free the slot */
+    ASSERT_EQ(rel4u_client_disconnect(c1), REL4U_OK);
+    rel4u_time_sleep_ms(50);
+
+    /* c2 retries connection: must succeed without thread leak or UAF */
+    ASSERT_EQ(rel4u_client_connect(c2), REL4U_OK);
+    ASSERT_EQ(rel4u_client_get_state(c2), REL4U_STATE_CONNECTED);
+
+    const char* m = "hello_after_retry";
+    ASSERT_EQ(rel4u_client_send(c2, REL4U_MODE_RELIABLE_ORDERED, m, strlen(m)), REL4U_OK);
+
+    char buf[64]; size_t len; uint32_t cid;
+    ASSERT_EQ(rel4u_server_recv(server, &cid, buf, sizeof(buf), &len, 1000), REL4U_OK);
+    buf[len] = '\0';
+    ASSERT_STR_EQ(buf, m);
+
+    rel4u_client_destroy(c1);
+    rel4u_client_destroy(c2);
+    rel4u_server_destroy(server);
+    return true;
+}
+
+static bool test_regression_reconnect_after_explicit_disconnect(void) {
+    rel4u_server_config_t s_cfg;
+    memset(&s_cfg, 0, sizeof(s_cfg));
+    s_cfg.bind_port = 19132;
+    s_cfg.max_clients = 4;
+
+    rel4u_server_t* server = rel4u_server_create(&s_cfg);
+    ASSERT_TRUE(server != NULL);
+    ASSERT_EQ(rel4u_server_start(server), REL4U_OK);
+
+    rel4u_client_config_t c_cfg;
+    memset(&c_cfg, 0, sizeof(c_cfg));
+    c_cfg.server_address = "127.0.0.1";
+    c_cfg.server_port = 19132;
+    c_cfg.connect_timeout_ms = 1000;
+
+    rel4u_client_t* client = rel4u_client_create(&c_cfg);
+    ASSERT_TRUE(client != NULL);
+    ASSERT_EQ(rel4u_client_connect(client), REL4U_OK);
+
+    /* Send 50 reliable messages */
+    char buf[64]; size_t len; uint32_t cid;
+    for (int i = 0; i < 50; i++) {
+        char msg[32]; snprintf(msg, sizeof(msg), "m1_%02d", i);
+        ASSERT_EQ(rel4u_client_send(client, REL4U_MODE_RELIABLE_ORDERED, msg, strlen(msg)), REL4U_OK);
+        ASSERT_EQ(rel4u_server_recv(server, &cid, buf, sizeof(buf), &len, 1000), REL4U_OK);
+    }
+
+    /* Explicit disconnect */
+    ASSERT_EQ(rel4u_client_disconnect(client), REL4U_OK);
+    rel4u_time_sleep_ms(50);
+
+    /* Reconnect */
+    ASSERT_EQ(rel4u_client_connect(client), REL4U_OK);
+    ASSERT_EQ(rel4u_client_get_state(client), REL4U_STATE_CONNECTED);
+
+    /* Send reliable messages in new session: must NOT fail due to stale sequence numbers */
+    const char* m_after = "message_after_reconnect";
+    ASSERT_EQ(rel4u_client_send(client, REL4U_MODE_RELIABLE_ORDERED, m_after, strlen(m_after)), REL4U_OK);
+
+    ASSERT_EQ(rel4u_server_recv(server, &cid, buf, sizeof(buf), &len, 2000), REL4U_OK);
+    buf[len] = '\0';
+    ASSERT_STR_EQ(buf, m_after);
+
+    rel4u_client_destroy(client);
+    rel4u_server_destroy(server);
+    return true;
+}
+
+static bool test_regression_handshake_loss_recovery(void) {
+    uint16_t srv_port = 19134;
+    uint16_t proxy_port = 19133;
+
+    rel4u_server_config_t s_cfg;
+    memset(&s_cfg, 0, sizeof(s_cfg));
+    s_cfg.bind_port = srv_port;
+    s_cfg.max_clients = 4;
+
+    rel4u_server_t* server = rel4u_server_create(&s_cfg);
+    ASSERT_TRUE(server != NULL);
+    ASSERT_EQ(rel4u_server_start(server), REL4U_OK);
+
+    /* Drop initial handshake packet (CONNECT_ACK) */
+    rel4u_net_sim_config_t sim_cfg;
+    memset(&sim_cfg, 0, sizeof(sim_cfg));
+    sim_cfg.burst_drop_interval = 2;
+    sim_cfg.burst_drop_count = 1;
+
+    rel4u_net_sim_t* sim = rel4u_net_sim_create(proxy_port, srv_port, &sim_cfg);
+    ASSERT_TRUE(sim != NULL);
+    ASSERT_EQ(rel4u_net_sim_start(sim), 0);
+
+    rel4u_client_config_t c_cfg;
+    memset(&c_cfg, 0, sizeof(c_cfg));
+    c_cfg.server_address = "127.0.0.1";
+    c_cfg.server_port = proxy_port;
+    c_cfg.connect_timeout_ms = 4000;
+    c_cfg.reconnect_interval_ms = 100;
+
+    rel4u_client_t* client = rel4u_client_create(&c_cfg);
+    ASSERT_TRUE(client != NULL);
+    ASSERT_EQ(rel4u_client_connect(client), REL4U_OK);
+
+    /* Restore normal network */
+    rel4u_time_sleep_ms(50);
+    memset(&sim_cfg, 0, sizeof(sim_cfg));
+    rel4u_net_sim_set_config(sim, &sim_cfg);
+
+    /* Client sends to register with server */
+    char buf[64]; size_t len; uint32_t cid = 0;
+    ASSERT_EQ(rel4u_client_send(client, REL4U_MODE_RELIABLE_ORDERED, "c2s", 3), REL4U_OK);
+    ASSERT_EQ(rel4u_server_recv(server, &cid, buf, sizeof(buf), &len, 2000), REL4U_OK);
+
+    /* Server sends to client: must be delivered and not discarded */
+    const char* s2c = "server_to_client_handshake_recovery";
+    ASSERT_EQ(rel4u_server_send(server, cid, REL4U_MODE_RELIABLE_ORDERED, s2c, strlen(s2c)), REL4U_OK);
+
+    ASSERT_EQ(rel4u_client_recv(client, buf, sizeof(buf), &len, 2000), REL4U_OK);
+    buf[len] = '\0';
+    ASSERT_STR_EQ(buf, s2c);
+
+    rel4u_client_destroy(client);
+    rel4u_net_sim_destroy(sim);
+    rel4u_server_destroy(server);
+    return true;
+}
+
+static bool test_regression_large_window_reassembly(void) {
+    uint16_t srv_port = 19136;
+    uint16_t proxy_port = 19135;
+
+    rel4u_server_config_t s_cfg;
+    memset(&s_cfg, 0, sizeof(s_cfg));
+    s_cfg.bind_port = srv_port;
+    s_cfg.max_clients = 4;
+    s_cfg.window_size = 128; /* Large window > 64 */
+
+    rel4u_server_t* server = rel4u_server_create(&s_cfg);
+    ASSERT_TRUE(server != NULL);
+    ASSERT_EQ(rel4u_server_start(server), REL4U_OK);
+
+    rel4u_net_sim_config_t sim_cfg;
+    memset(&sim_cfg, 0, sizeof(sim_cfg));
+    sim_cfg.drop_rate = 0.15;
+    sim_cfg.reorder_rate = 0.15;
+
+    rel4u_net_sim_t* sim = rel4u_net_sim_create(proxy_port, srv_port, &sim_cfg);
+    ASSERT_TRUE(sim != NULL);
+    ASSERT_EQ(rel4u_net_sim_start(sim), 0);
+
+    rel4u_client_config_t c_cfg;
+    memset(&c_cfg, 0, sizeof(c_cfg));
+    c_cfg.server_address = "127.0.0.1";
+    c_cfg.server_port = proxy_port;
+    c_cfg.window_size = 128;
+    c_cfg.connect_timeout_ms = 3000;
+
+    rel4u_client_t* client = rel4u_client_create(&c_cfg);
+    ASSERT_TRUE(client != NULL);
+    ASSERT_EQ(rel4u_client_connect(client), REL4U_OK);
+
+    int count = 90;
+    for (int i = 0; i < count; i++) {
+        char msg[32]; snprintf(msg, sizeof(msg), "win128_%03d", i);
+        ASSERT_EQ(rel4u_client_send(client, REL4U_MODE_RELIABLE_ORDERED, msg, strlen(msg)), REL4U_OK);
+    }
+
+    char buf[64]; size_t len; uint32_t cid;
+    for (int i = 0; i < count; i++) {
+        char expected[32]; snprintf(expected, sizeof(expected), "win128_%03d", i);
+        ASSERT_EQ(rel4u_server_recv(server, &cid, buf, sizeof(buf), &len, 10000), REL4U_OK);
+        buf[len] = '\0';
+        ASSERT_STR_EQ(buf, expected);
+    }
+
+    rel4u_client_destroy(client);
+    rel4u_net_sim_destroy(sim);
+    rel4u_server_destroy(server);
+    return true;
+}
+
+static bool test_stress_server_to_client_loss(void) {
+    uint16_t srv_port = 19138;
+    uint16_t proxy_port = 19137;
+
+    rel4u_server_config_t s_cfg;
+    memset(&s_cfg, 0, sizeof(s_cfg));
+    s_cfg.bind_port = srv_port;
+    s_cfg.max_clients = 4;
+    s_cfg.send_queue_capacity = 1024;
+    s_cfg.recv_queue_capacity = 1024;
+
+    rel4u_server_t* server = rel4u_server_create(&s_cfg);
+    ASSERT_TRUE(server != NULL);
+    ASSERT_EQ(rel4u_server_start(server), REL4U_OK);
+
+    rel4u_net_sim_config_t sim_cfg;
+    memset(&sim_cfg, 0, sizeof(sim_cfg));
+    sim_cfg.drop_rate = 0.20; /* 20% loss */
+
+    rel4u_net_sim_t* sim = rel4u_net_sim_create(proxy_port, srv_port, &sim_cfg);
+    ASSERT_TRUE(sim != NULL);
+    ASSERT_EQ(rel4u_net_sim_start(sim), 0);
+
+    rel4u_client_config_t c_cfg;
+    memset(&c_cfg, 0, sizeof(c_cfg));
+    c_cfg.server_address = "127.0.0.1";
+    c_cfg.server_port = proxy_port;
+    c_cfg.send_queue_capacity = 1024;
+    c_cfg.recv_queue_capacity = 1024;
+    c_cfg.connect_timeout_ms = 5000;
+
+    rel4u_client_t* client = rel4u_client_create(&c_cfg);
+    ASSERT_TRUE(client != NULL);
+    ASSERT_EQ(rel4u_client_connect(client), REL4U_OK);
+
+    /* Initial ping to register client ID */
+    ASSERT_EQ(rel4u_client_send(client, REL4U_MODE_RELIABLE_ORDERED, "init", 4), REL4U_OK);
+    char buf[64]; size_t len; uint32_t cid = 0;
+    ASSERT_EQ(rel4u_server_recv(server, &cid, buf, sizeof(buf), &len, 5000), REL4U_OK);
+
+    int num_messages = is_heavy_stress_mode() ? 200 : 50;
+
+    /* Server sends reliable stream to client */
+    for (int i = 0; i < num_messages; i++) {
+        char msg[64]; snprintf(msg, sizeof(msg), "s2c_loss_%04d", i);
+        ASSERT_EQ(rel4u_server_send(server, cid, REL4U_MODE_RELIABLE_ORDERED, msg, strlen(msg)), REL4U_OK);
+    }
+
+    /* Client receives all messages in strictly contiguous order */
+    for (int i = 0; i < num_messages; i++) {
+        char expected[64]; snprintf(expected, sizeof(expected), "s2c_loss_%04d", i);
+        ASSERT_EQ(rel4u_client_recv(client, buf, sizeof(buf), &len, 10000), REL4U_OK);
+        buf[len] = '\0';
+        ASSERT_STR_EQ(buf, expected);
+    }
+
+    rel4u_stats_t slot_stats;
+    ASSERT_EQ(rel4u_server_get_client_stats(server, cid, &slot_stats), REL4U_OK);
+    ASSERT_TRUE(slot_stats.packets_retransmitted > 0);
+
+    rel4u_client_destroy(client);
+    rel4u_net_sim_destroy(sim);
+    rel4u_server_destroy(server);
+    return true;
+}
+
+static bool test_server_fanout_concurrent_clients(void) {
+    rel4u_server_config_t s_cfg;
+    memset(&s_cfg, 0, sizeof(s_cfg));
+    s_cfg.bind_port = 19139;
+    s_cfg.max_clients = 8;
+
+    rel4u_server_t* server = rel4u_server_create(&s_cfg);
+    ASSERT_TRUE(server != NULL);
+    ASSERT_EQ(rel4u_server_start(server), REL4U_OK);
+
+    #define FANOUT_CLIENTS 3
+    rel4u_client_t* clients[FANOUT_CLIENTS];
+    uint32_t cids[FANOUT_CLIENTS];
+
+    for (int i = 0; i < FANOUT_CLIENTS; i++) {
+        rel4u_client_config_t c_cfg;
+        memset(&c_cfg, 0, sizeof(c_cfg));
+        c_cfg.server_address = "127.0.0.1";
+        c_cfg.server_port = 19139;
+        clients[i] = rel4u_client_create(&c_cfg);
+        ASSERT_TRUE(clients[i] != NULL);
+        ASSERT_EQ(rel4u_client_connect(clients[i]), REL4U_OK);
+
+        /* Client pings server so server learns its client_id */
+        char ping[16]; snprintf(ping, sizeof(ping), "ping_%d", i);
+        ASSERT_EQ(rel4u_client_send(clients[i], REL4U_MODE_RELIABLE_ORDERED, ping, strlen(ping)), REL4U_OK);
+
+        char rbuf[64]; size_t rlen; uint32_t cid;
+        ASSERT_EQ(rel4u_server_recv(server, &cid, rbuf, sizeof(rbuf), &rlen, 1000), REL4U_OK);
+        cids[i] = cid;
+    }
+
+    /* Server fans out 20 messages to each client */
+    for (int m = 0; m < 20; m++) {
+        for (int i = 0; i < FANOUT_CLIENTS; i++) {
+            char msg[32]; snprintf(msg, sizeof(msg), "c%d_msg_%02d", i, m);
+            ASSERT_EQ(rel4u_server_send(server, cids[i], REL4U_MODE_RELIABLE_ORDERED, msg, strlen(msg)), REL4U_OK);
+        }
+    }
+
+    /* Verify each client receives only its own messages in order */
+    for (int i = 0; i < FANOUT_CLIENTS; i++) {
+        for (int m = 0; m < 20; m++) {
+            char expected[32]; snprintf(expected, sizeof(expected), "c%d_msg_%02d", i, m);
+            char rbuf[64]; size_t rlen = 0;
+            ASSERT_EQ(rel4u_client_recv(clients[i], rbuf, sizeof(rbuf), &rlen, 1000), REL4U_OK);
+            rbuf[rlen] = '\0';
+            ASSERT_STR_EQ(rbuf, expected);
+        }
+        rel4u_client_destroy(clients[i]);
+    }
+    #undef FANOUT_CLIENTS
+
+    rel4u_server_destroy(server);
+    return true;
+}
+
 TEST_SUITE_BEGIN("rel4u Integration Tests")
     RUN_TEST(test_client_server_connect_disconnect);
     RUN_TEST(test_all_delivery_modes);
@@ -1055,5 +1465,12 @@ TEST_SUITE_BEGIN("rel4u Integration Tests")
     RUN_TEST(test_stress_packet_reordering_and_duplication);
     RUN_TEST(test_stress_multi_client_concurrent_loss);
     RUN_TEST(test_stress_mixed_delivery_modes_under_loss);
+    RUN_TEST(test_regression_large_mtu_support);
+    RUN_TEST(test_regression_rejected_client_cleanup);
+    RUN_TEST(test_regression_reconnect_after_explicit_disconnect);
+    RUN_TEST(test_regression_handshake_loss_recovery);
+    RUN_TEST(test_regression_large_window_reassembly);
+    RUN_TEST(test_stress_server_to_client_loss);
+    RUN_TEST(test_server_fanout_concurrent_clients);
 TEST_SUITE_END()
 

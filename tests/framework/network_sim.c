@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #define MAX_SIM_CLIENTS 64
 #define MAX_DELAYED_PACKETS 1024
@@ -41,7 +42,7 @@ struct rel4u_net_sim {
 
     rel4u_thread_t         worker_thread;
     rel4u_mutex_t          mutex;
-    bool                   running;
+    atomic_bool            running;
     uint32_t               prng_state;
 
     rel4u_net_sim_config_t config;
@@ -201,12 +202,19 @@ static void sim_process_packet(rel4u_net_sim_t* sim, bool is_client_to_server, i
         if (is_client_to_server) sim->stats.client_packets_forwarded++;
         else sim->stats.server_packets_forwarded++;
     } else {
-        sim_enqueue_delayed(sim, send_sock, dest_addr, data, len, now_ms + latency);
-        if (duplicate) {
-            sim_enqueue_delayed(sim, send_sock, dest_addr, data, len, now_ms + latency + 2);
+        if (sim_enqueue_delayed(sim, send_sock, dest_addr, data, len, now_ms + latency)) {
+            if (is_client_to_server) sim->stats.client_packets_forwarded++;
+            else sim->stats.server_packets_forwarded++;
+        } else {
+            if (is_client_to_server) sim->stats.client_packets_dropped++;
+            else sim->stats.server_packets_dropped++;
         }
-        if (is_client_to_server) sim->stats.client_packets_forwarded++;
-        else sim->stats.server_packets_forwarded++;
+        if (duplicate) {
+            if (sim_enqueue_delayed(sim, send_sock, dest_addr, data, len, now_ms + latency + 2)) {
+                if (is_client_to_server) sim->stats.client_packets_forwarded++;
+                else sim->stats.server_packets_forwarded++;
+            }
+        }
     }
 }
 
@@ -215,7 +223,7 @@ static void* sim_worker_thread_func(void* arg)
     rel4u_net_sim_t* sim = (rel4u_net_sim_t*)arg;
     uint8_t buffer[MAX_PACKET_SIZE];
 
-    while (sim->running) {
+    while (atomic_load(&sim->running)) {
         uint64_t now_ms = rel4u_time_now_ms();
 
         rel4u_mutex_lock(&sim->mutex);
@@ -326,7 +334,12 @@ rel4u_net_sim_t* rel4u_net_sim_create(uint16_t proxy_port, uint16_t target_serve
 
     sim->proxy_port = proxy_port;
     sim->target_server_port = target_server_port;
-    sim->prng_state = 123456789u + (uint32_t)rel4u_time_now_ns();
+    const char* env_seed = getenv("REL4U_SIM_SEED");
+    if (env_seed && *env_seed) {
+        sim->prng_state = (uint32_t)strtoul(env_seed, NULL, 0);
+    } else {
+        sim->prng_state = 123456789u + (uint32_t)rel4u_time_now_ns();
+    }
     if (config) {
         sim->config = *config;
     }
@@ -358,14 +371,15 @@ rel4u_net_sim_t* rel4u_net_sim_create(uint16_t proxy_port, uint16_t target_serve
     }
 
     rel4u_mutex_init(&sim->mutex);
+    atomic_store(&sim->running, false);
     return sim;
 }
 
 int rel4u_net_sim_start(rel4u_net_sim_t* sim) {
     if (!sim) return -1;
-    sim->running = true;
+    atomic_store(&sim->running, true);
     if (rel4u_thread_create(&sim->worker_thread, sim_worker_thread_func, sim) != 0) {
-        sim->running = false;
+        atomic_store(&sim->running, false);
         return -1;
     }
     return 0;
@@ -387,15 +401,15 @@ void rel4u_net_sim_get_stats(rel4u_net_sim_t* sim, rel4u_net_sim_stats_t* out_st
 }
 
 void rel4u_net_sim_stop(rel4u_net_sim_t* sim) {
-    if (!sim || !sim->running) return;
-    sim->running = false;
+    if (!sim || !atomic_load(&sim->running)) return;
+    atomic_store(&sim->running, false);
     rel4u_wakeup_pipe_signal(&sim->wakeup_pipe);
     rel4u_thread_join(sim->worker_thread);
 }
 
 void rel4u_net_sim_destroy(rel4u_net_sim_t* sim) {
     if (!sim) return;
-    if (sim->running) {
+    if (atomic_load(&sim->running)) {
         rel4u_net_sim_stop(sim);
     }
     rel4u_wakeup_pipe_close(&sim->wakeup_pipe);

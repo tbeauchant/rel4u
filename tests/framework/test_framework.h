@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdint.h>
 
 static int g_tests_run = 0;
 static int g_tests_failed = 0;
@@ -51,16 +52,44 @@ static int g_tests_failed = 0;
 
 #define ASSERT_EQ(a, b) \
     do { \
-        if ((a) != (b)) { \
-            fprintf(stderr, "    ASSERTION FAILED: %s == %s (at %s:%d)\n", #a, #b, __FILE__, __LINE__); \
+        intptr_t _va = (intptr_t)(a); \
+        intptr_t _vb = (intptr_t)(b); \
+        if (_va != _vb) { \
+            fprintf(stderr, "    ASSERTION FAILED: %s == %s (got %lld, expected %lld at %s:%d)\n", \
+                    #a, #b, (long long)_va, (long long)_vb, __FILE__, __LINE__); \
             return false; \
         } \
     } while (0)
 
 #define ASSERT_NE(a, b) \
     do { \
-        if ((a) == (b)) { \
-            fprintf(stderr, "    ASSERTION FAILED: %s != %s (at %s:%d)\n", #a, #b, __FILE__, __LINE__); \
+        intptr_t _va = (intptr_t)(a); \
+        intptr_t _vb = (intptr_t)(b); \
+        if (_va == _vb) { \
+            fprintf(stderr, "    ASSERTION FAILED: %s != %s (both are %lld at %s:%d)\n", \
+                    #a, #b, (long long)_va, __FILE__, __LINE__); \
+            return false; \
+        } \
+    } while (0)
+
+#define ASSERT_GTE(a, b) \
+    do { \
+        intptr_t _va = (intptr_t)(a); \
+        intptr_t _vb = (intptr_t)(b); \
+        if (_va < _vb) { \
+            fprintf(stderr, "    ASSERTION FAILED: %s >= %s (got %lld, expected >= %lld at %s:%d)\n", \
+                    #a, #b, (long long)_va, (long long)_vb, __FILE__, __LINE__); \
+            return false; \
+        } \
+    } while (0)
+
+#define ASSERT_LTE(a, b) \
+    do { \
+        intptr_t _va = (intptr_t)(a); \
+        intptr_t _vb = (intptr_t)(b); \
+        if (_va > _vb) { \
+            fprintf(stderr, "    ASSERTION FAILED: %s <= %s (got %lld, expected <= %lld at %s:%d)\n", \
+                    #a, #b, (long long)_va, (long long)_vb, __FILE__, __LINE__); \
             return false; \
         } \
     } while (0)
