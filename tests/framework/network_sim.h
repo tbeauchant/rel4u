@@ -25,6 +25,11 @@ typedef struct rel4u_net_sim_config {
     uint32_t delay_max_ms;         /**< Maximum latency in ms (delay_max_ms >= delay_min_ms) */
     double   duplicate_rate;       /**< 0.0 to 1.0: Packet duplication probability */
     double   reorder_rate;         /**< 0.0 to 1.0: Packet out-of-order reordering probability */
+    uint32_t hold_data_seq;        /**< Hold this DATA sequence until release_data_seq (0 disables). */
+    uint32_t release_data_seq;
+    bool     hold_server_packets;  /**< false: client -> server; true: server -> client. */
+    uint8_t  drop_packet_type;      /**< Drop the first matching packet type (0 disables). */
+    bool     drop_server_packets;
 } rel4u_net_sim_config_t;
 
 typedef struct rel4u_net_sim_stats {
@@ -36,6 +41,9 @@ typedef struct rel4u_net_sim_stats {
     uint64_t server_packets_forwarded;
     uint64_t server_packets_dropped;
     uint64_t server_packets_duplicated;
+    uint64_t data_packets_held;
+    uint64_t held_packets_released;
+    uint64_t scripted_packets_dropped;
 } rel4u_net_sim_stats_t;
 
 typedef struct rel4u_net_sim rel4u_net_sim_t;
@@ -70,6 +78,11 @@ void rel4u_net_sim_set_config(rel4u_net_sim_t* sim, const rel4u_net_sim_config_t
  * @param out_stats Pointer to destination stats struct.
  */
 void rel4u_net_sim_get_stats(rel4u_net_sim_t* sim, rel4u_net_sim_stats_t* out_stats);
+
+/* Test probes use the first connected client's real proxy endpoints. Injection
+ * bypasses impairments so malformed/stale traffic can be tested independently. */
+uint32_t rel4u_net_sim_session_id(rel4u_net_sim_t* sim);
+int rel4u_net_sim_inject(rel4u_net_sim_t* sim, bool from_server, const void* data, size_t len);
 
 /**
  * @brief Stop proxy worker thread.

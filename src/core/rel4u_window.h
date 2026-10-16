@@ -31,6 +31,8 @@ static inline int32_t rel4u_seq_diff(uint32_t a, uint32_t b) {
     return (int32_t)(a - b);
 }
 
+#define REL4U_MAX_PAYLOAD_SIZE 9216
+
 /* Send Window Slot */
 typedef struct rel4u_send_slot {
     uint32_t seq_num;
@@ -41,7 +43,7 @@ typedef struct rel4u_send_slot {
     uint8_t  delivery_mode;
     bool     in_use;
     bool     acked;
-    uint8_t  payload[REL4U_DEFAULT_MTU];
+    uint8_t  payload[REL4U_MAX_PAYLOAD_SIZE];
 } rel4u_send_slot_t;
 
 /* Send Window */
@@ -60,7 +62,7 @@ typedef struct rel4u_recv_slot {
     uint16_t payload_len;
     uint8_t  delivery_mode;
     bool     received;
-    uint8_t  payload[REL4U_DEFAULT_MTU];
+    uint8_t  payload[REL4U_MAX_PAYLOAD_SIZE];
 } rel4u_recv_slot_t;
 
 /* Receive Window */
@@ -102,6 +104,12 @@ int  rel4u_recv_window_reset(rel4u_recv_window_t* win, uint32_t initial_seq);
  */
 int  rel4u_recv_window_on_packet(rel4u_recv_window_t* win, const rel4u_header_t* hdr, const uint8_t* payload,
                                  rel4u_recv_slot_t* out_ready_slots, size_t max_ready, size_t* out_ready_count);
+
+/**
+ * @brief Pop contiguous in-order ready packets from receive window.
+ */
+int  rel4u_recv_window_pop_ready(rel4u_recv_window_t* win, rel4u_recv_slot_t* out_ready_slots,
+                                 size_t max_ready, size_t* out_ready_count);
 
 /**
  * @brief Calculate current ack_num and 32-bit sack_mask from receive window state.

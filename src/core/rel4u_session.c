@@ -4,7 +4,7 @@
 
 int rel4u_session_table_init(rel4u_session_table_t* table, uint32_t max_clients,
                               rel4u_max_clients_policy_t policy, uint32_t window_size) {
-    if (!table || max_clients == 0) return -1;
+    if (!table || max_clients == 0 || window_size < 2 || (window_size & (window_size - 1)) != 0) return -1;
 
     table->max_clients = max_clients;
     table->active_count = 0;
@@ -16,8 +16,11 @@ int rel4u_session_table_init(rel4u_session_table_t* table, uint32_t max_clients,
     for (uint32_t i = 0; i < max_clients; i++) {
         table->sessions[i].client_id = i;
         table->sessions[i].state = REL4U_STATE_DISCONNECTED;
-        rel4u_send_window_init(&table->sessions[i].send_win, window_size, 1);
-        rel4u_recv_window_init(&table->sessions[i].recv_win, window_size, 1);
+        if (rel4u_send_window_init(&table->sessions[i].send_win, window_size, 1) != 0 ||
+            rel4u_recv_window_init(&table->sessions[i].recv_win, window_size, 1) != 0) {
+            rel4u_session_table_destroy(table);
+            return -1;
+        }
         rel4u_rtt_init(&table->sessions[i].rtt, REL4U_RTT_DEFAULT_RTO_MS, REL4U_RTT_MIN_RTO_MS, REL4U_RTT_MAX_RTO_MS);
     }
 

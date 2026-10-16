@@ -4,10 +4,12 @@
 #include "../../src/platform/rel4u_net.h"
 #include "../../src/platform/rel4u_threads.h"
 #include "../../src/platform/rel4u_time.h"
+#include "../../src/core/rel4u_packet.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #define MAX_SIM_CLIENTS 64
 #define MAX_DELAYED_PACKETS 1024
@@ -29,6 +31,7 @@ typedef struct sim_client_session {
     uint32_t         c2s_packet_count;
     uint32_t         s2c_packet_count;
     uint64_t         last_active_ms;
+    uint32_t         session_id;
 } sim_client_session_t;
 
 struct rel4u_net_sim {
@@ -41,11 +44,14 @@ struct rel4u_net_sim {
 
     rel4u_thread_t         worker_thread;
     rel4u_mutex_t          mutex;
-    bool                   running;
+    atomic_bool            running;
     uint32_t               prng_state;
 
     rel4u_net_sim_config_t config;
     rel4u_net_sim_stats_t  stats;
+    sim_delayed_packet_t held_packet;
+    bool hold_released;
+    bool scripted_drop_done;
 
     sim_client_session_t   clients[MAX_SIM_CLIENTS];
     sim_delayed_packet_t   delayed_queue[MAX_DELAYED_PACKETS];
@@ -153,6 +159,48 @@ static void sim_process_packet(rel4u_net_sim_t* sim, bool is_client_to_server, i
     uint32_t packet_num = is_client_to_server ? sim->clients[client_idx].c2s_packet_count
                                               : sim->clients[client_idx].s2c_packet_count;
 
+    rel4u_header_t hdr;
+    if (rel4u_packet_decode_header(data, len, &hdr) == 0) {
+        if (!is_client_to_server && hdr.packet_type == REL4U_PKT_CONNECT_RESP) {
+            sim->clients[client_idx].session_id = hdr.session_id;
+        }
+        if (sim->config.drop_packet_type != 0 && !sim->scripted_drop_done &&
+            sim->config.drop_packet_type == hdr.packet_type &&
+            sim->config.drop_server_packets == !is_client_to_server) {
+            sim->scripted_drop_done = true;
+            sim->stats.scripted_packets_dropped++;
+            if (is_client_to_server) sim->stats.client_packets_dropped++;
+            else sim->stats.server_packets_dropped++;
+            return;
+        }
+        if (hdr.packet_type == REL4U_PKT_DATA && sim->config.hold_data_seq != 0 &&
+            sim->config.hold_server_packets == !is_client_to_server && !sim->hold_released) {
+            if (hdr.seq_num == sim->config.hold_data_seq) {
+                if (!sim->held_packet.in_use && len <= MAX_PACKET_SIZE) {
+                    sim->held_packet.in_use = true;
+                    sim->held_packet.send_sock = send_sock;
+                    sim->held_packet.dest_addr = *dest_addr;
+                    sim->held_packet.len = len;
+                    memcpy(sim->held_packet.data, data, len);
+                    sim->stats.data_packets_held++;
+                }
+                return;
+            }
+            if (hdr.seq_num == sim->config.release_data_seq && sim->held_packet.in_use) {
+                /* Forward the end of the contiguous batch before filling its hole. */
+                rel4u_net_sendto(send_sock, data, len, dest_addr);
+                rel4u_net_sendto(sim->held_packet.send_sock, sim->held_packet.data,
+                                 sim->held_packet.len, &sim->held_packet.dest_addr);
+                if (is_client_to_server) sim->stats.client_packets_forwarded += 2;
+                else sim->stats.server_packets_forwarded += 2;
+                sim->held_packet.in_use = false;
+                sim->hold_released = true;
+                sim->stats.held_packets_released++;
+                return;
+            }
+        }
+    }
+
     // 1. Check Burst Drop
     if (sim->config.burst_drop_interval > 0 && sim->config.burst_drop_count > 0) {
         uint32_t pos = packet_num % sim->config.burst_drop_interval;
@@ -201,12 +249,19 @@ static void sim_process_packet(rel4u_net_sim_t* sim, bool is_client_to_server, i
         if (is_client_to_server) sim->stats.client_packets_forwarded++;
         else sim->stats.server_packets_forwarded++;
     } else {
-        sim_enqueue_delayed(sim, send_sock, dest_addr, data, len, now_ms + latency);
-        if (duplicate) {
-            sim_enqueue_delayed(sim, send_sock, dest_addr, data, len, now_ms + latency + 2);
+        if (sim_enqueue_delayed(sim, send_sock, dest_addr, data, len, now_ms + latency)) {
+            if (is_client_to_server) sim->stats.client_packets_forwarded++;
+            else sim->stats.server_packets_forwarded++;
+        } else {
+            if (is_client_to_server) sim->stats.client_packets_dropped++;
+            else sim->stats.server_packets_dropped++;
         }
-        if (is_client_to_server) sim->stats.client_packets_forwarded++;
-        else sim->stats.server_packets_forwarded++;
+        if (duplicate) {
+            if (sim_enqueue_delayed(sim, send_sock, dest_addr, data, len, now_ms + latency + 2)) {
+                if (is_client_to_server) sim->stats.client_packets_forwarded++;
+                else sim->stats.server_packets_forwarded++;
+            }
+        }
     }
 }
 
@@ -215,7 +270,7 @@ static void* sim_worker_thread_func(void* arg)
     rel4u_net_sim_t* sim = (rel4u_net_sim_t*)arg;
     uint8_t buffer[MAX_PACKET_SIZE];
 
-    while (sim->running) {
+    while (atomic_load(&sim->running)) {
         uint64_t now_ms = rel4u_time_now_ms();
 
         rel4u_mutex_lock(&sim->mutex);
@@ -326,7 +381,17 @@ rel4u_net_sim_t* rel4u_net_sim_create(uint16_t proxy_port, uint16_t target_serve
 
     sim->proxy_port = proxy_port;
     sim->target_server_port = target_server_port;
-    sim->prng_state = 123456789u + (uint32_t)rel4u_time_now_ns();
+    const char* env_seed = getenv("REL4U_SIM_SEED");
+    if (env_seed && *env_seed) {
+        sim->prng_state = (uint32_t)strtoul(env_seed, NULL, 0);
+    } else {
+        sim->prng_state = 123456789u;
+    }
+    if (sim->prng_state == 0) {
+        sim->prng_state = 123456789u;
+    }
+    printf("  [SIM] ports %u -> %u, seed %u\n", (unsigned)proxy_port,
+           (unsigned)target_server_port, (unsigned)sim->prng_state);
     if (config) {
         sim->config = *config;
     }
@@ -358,14 +423,15 @@ rel4u_net_sim_t* rel4u_net_sim_create(uint16_t proxy_port, uint16_t target_serve
     }
 
     rel4u_mutex_init(&sim->mutex);
+    atomic_store(&sim->running, false);
     return sim;
 }
 
 int rel4u_net_sim_start(rel4u_net_sim_t* sim) {
     if (!sim) return -1;
-    sim->running = true;
+    atomic_store(&sim->running, true);
     if (rel4u_thread_create(&sim->worker_thread, sim_worker_thread_func, sim) != 0) {
-        sim->running = false;
+        atomic_store(&sim->running, false);
         return -1;
     }
     return 0;
@@ -374,7 +440,15 @@ int rel4u_net_sim_start(rel4u_net_sim_t* sim) {
 void rel4u_net_sim_set_config(rel4u_net_sim_t* sim, const rel4u_net_sim_config_t* config) {
     if (!sim || !config) return;
     rel4u_mutex_lock(&sim->mutex);
+    /* A scenario must release its held packet before reconfiguring. */
+    if (sim->held_packet.in_use) {
+        rel4u_net_sendto(sim->held_packet.send_sock, sim->held_packet.data,
+                         sim->held_packet.len, &sim->held_packet.dest_addr);
+        sim->held_packet.in_use = false;
+    }
     sim->config = *config;
+    sim->hold_released = false;
+    sim->scripted_drop_done = false;
     rel4u_mutex_unlock(&sim->mutex);
     rel4u_wakeup_pipe_signal(&sim->wakeup_pipe);
 }
@@ -386,16 +460,35 @@ void rel4u_net_sim_get_stats(rel4u_net_sim_t* sim, rel4u_net_sim_stats_t* out_st
     rel4u_mutex_unlock(&sim->mutex);
 }
 
+uint32_t rel4u_net_sim_session_id(rel4u_net_sim_t* sim) {
+    rel4u_mutex_lock(&sim->mutex);
+    uint32_t session_id = sim->clients[0].session_id;
+    rel4u_mutex_unlock(&sim->mutex);
+    return session_id;
+}
+
+int rel4u_net_sim_inject(rel4u_net_sim_t* sim, bool from_server, const void* data, size_t len) {
+    rel4u_mutex_lock(&sim->mutex);
+    int result = -1;
+    if (sim->clients[0].active) {
+        result = from_server
+            ? rel4u_net_sendto(sim->proxy_listen_sock, data, len, &sim->clients[0].client_addr)
+            : rel4u_net_sendto(sim->clients[0].worker_sock, data, len, &sim->target_server_addr);
+    }
+    rel4u_mutex_unlock(&sim->mutex);
+    return result;
+}
+
 void rel4u_net_sim_stop(rel4u_net_sim_t* sim) {
-    if (!sim || !sim->running) return;
-    sim->running = false;
+    if (!sim || !atomic_load(&sim->running)) return;
+    atomic_store(&sim->running, false);
     rel4u_wakeup_pipe_signal(&sim->wakeup_pipe);
     rel4u_thread_join(sim->worker_thread);
 }
 
 void rel4u_net_sim_destroy(rel4u_net_sim_t* sim) {
     if (!sim) return;
-    if (sim->running) {
+    if (atomic_load(&sim->running)) {
         rel4u_net_sim_stop(sim);
     }
     rel4u_wakeup_pipe_close(&sim->wakeup_pipe);

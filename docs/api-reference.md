@@ -195,6 +195,7 @@ Binds the UDP socket and starts the background worker thread.
 int rel4u_server_stop(rel4u_server_t* server);
 ```
 Stops the worker thread and closes the socket without freeing internal memory.
+Clears active sessions and queued messages so a subsequent start begins fresh.
 
 #### `rel4u_server_destroy`
 ```c

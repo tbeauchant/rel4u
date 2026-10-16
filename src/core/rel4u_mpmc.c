@@ -42,6 +42,7 @@ void rel4u_mpmc_destroy(rel4u_mpmc_queue_t* q) {
     if (!q) return;
 
     rel4u_mutex_lock(&q->mutex);
+    q->wake_generation++;
     rel4u_cond_broadcast(&q->cond);
 
     if (q->mode == REL4U_MEM_DYNAMIC) {
@@ -298,6 +299,7 @@ bool rel4u_mpmc_pop_wait(rel4u_mpmc_queue_t* q, rel4u_mpmc_item_t* out_item, int
     if (!q || !out_item) return false;
 
     rel4u_mutex_lock(&q->mutex);
+    uint32_t gen = q->wake_generation;
 
     while (q->count == 0) {
         if (timeout_ms == 0) {
@@ -305,9 +307,13 @@ bool rel4u_mpmc_pop_wait(rel4u_mpmc_queue_t* q, rel4u_mpmc_item_t* out_item, int
             return false;
         } else if (timeout_ms < 0) {
             rel4u_cond_wait(&q->cond, &q->mutex);
+            if (q->count == 0 && q->wake_generation != gen) {
+                rel4u_mutex_unlock(&q->mutex);
+                return false;
+            }
         } else {
             bool signaled = rel4u_cond_timedwait_ms(&q->cond, &q->mutex, (uint32_t)timeout_ms);
-            if (!signaled && q->count == 0) {
+            if (q->count == 0 && (!signaled || q->wake_generation != gen)) {
                 rel4u_mutex_unlock(&q->mutex);
                 return false;
             }
@@ -322,6 +328,7 @@ bool rel4u_mpmc_pop_wait(rel4u_mpmc_queue_t* q, rel4u_mpmc_item_t* out_item, int
 void rel4u_mpmc_wake_all(rel4u_mpmc_queue_t* q) {
     if (q) {
         rel4u_mutex_lock(&q->mutex);
+        q->wake_generation++;
         rel4u_cond_broadcast(&q->cond);
         rel4u_mutex_unlock(&q->mutex);
     }

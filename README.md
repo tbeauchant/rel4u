@@ -148,6 +148,27 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+CTest includes normal and heavy integration scenarios, a shared-library API test,
+and test-framework cleanup checks. Network suites share a CTest resource lock, so
+`ctest --parallel` does not run conflicting UDP scenarios together. Each suite has
+a 180-second timeout. To run only the normal scenarios, add `-LE heavy`; to run
+only heavy scenarios, add `-L heavy`.
+
+On Linux, `test_shared_small_stack` repeats the shared-library test with a
+512 KiB stack limit to catch worker stack overflows on platforms with small
+default thread stacks.
+
+Network simulation uses a reproducible default seed (`123456789`) and prints the
+seed and ports. Set `REL4U_SIM_SEED` when running `test_integration` directly to
+explore another seed. The heavy CTest entry sets `REL4U_STRESS_LEVEL=heavy` and
+`REL4U_SIM_SEED=42`.
+
+For address/undefined-behavior checks, configure a separate GCC or Clang build
+with `-DREL4U_ENABLE_SANITIZERS=ON`. For line and branch coverage, configure a
+GCC build with `-DREL4U_ENABLE_COVERAGE=ON`, run CTest, then run
+`gcovr --root . --filter src/ --print-summary`. CI exercises Debug and Release on
+Linux, Windows, and macOS, and publishes sanitizer logs and a coverage report.
+
 ### Running the Included Examples
 
 In terminal 1:

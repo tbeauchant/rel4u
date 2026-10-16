@@ -5,8 +5,28 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+option(REL4U_ENABLE_SANITIZERS "Enable address and undefined-behavior sanitizers" OFF)
+option(REL4U_ENABLE_COVERAGE "Instrument tests and libraries for GCC coverage" OFF)
+if(REL4U_ENABLE_SANITIZERS)
+    if(MSVC)
+        message(FATAL_ERROR "REL4U_ENABLE_SANITIZERS requires GCC or Clang")
+    endif()
+    add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+if(REL4U_ENABLE_COVERAGE)
+    if(NOT CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        message(FATAL_ERROR "REL4U_ENABLE_COVERAGE requires GCC")
+    endif()
+    # Application and worker threads also share the injected coverage counters.
+    # Non-atomic updates corrupt branch counts in concurrent queue tests.
+    add_compile_options(--coverage -fprofile-update=atomic)
+    add_link_options(--coverage)
+endif()
+
 # Compiler Warnings & Flags
 if(MSVC)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     add_compile_options(/W4 /WX /permissive- /experimental:c11atomics)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter)
@@ -106,6 +126,14 @@ add_executable(test_window tests/unit/test_window.c)
 target_link_libraries(test_window PRIVATE rel4u_static)
 add_test(NAME test_window COMMAND test_window)
 
+add_executable(test_session tests/unit/test_session.c)
+target_link_libraries(test_session PRIVATE rel4u_static)
+add_test(NAME test_session COMMAND test_session)
+
+add_executable(test_api tests/unit/test_api.c)
+target_link_libraries(test_api PRIVATE rel4u_static)
+add_test(NAME test_api COMMAND test_api)
+
 # Integration Tests
 add_executable(test_integration
     tests/integration/test_integration.c
@@ -113,6 +141,33 @@ add_executable(test_integration
 )
 target_link_libraries(test_integration PRIVATE rel4u_static)
 add_test(NAME test_integration COMMAND test_integration)
+add_test(NAME test_integration_heavy COMMAND test_integration)
+set_tests_properties(test_integration_heavy PROPERTIES
+    ENVIRONMENT "REL4U_STRESS_LEVEL=heavy;REL4U_SIM_SEED=42"
+    LABELS "integration;heavy"
+)
+set_tests_properties(test_integration PROPERTIES LABELS "integration")
+
+add_executable(test_framework tests/unit/test_framework.c)
+add_test(NAME test_framework COMMAND test_framework)
+
+# Exercise the exported API through the shared library (including DLL loading).
+add_executable(test_shared tests/integration/test_shared.c)
+target_link_libraries(test_shared PRIVATE rel4u_shared)
+set_target_properties(test_shared PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/shared")
+add_test(NAME test_shared COMMAND test_shared)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Linux inherits the process stack limit for new pthreads. Reproduce small
+    # worker stacks here so oversized stack buffers also fail on Linux CI.
+    add_test(NAME test_shared_small_stack COMMAND /bin/sh
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/framework/run_small_stack.sh $<TARGET_FILE:test_shared>)
+    set_tests_properties(test_shared_small_stack PROPERTIES RESOURCE_LOCK rel4u_udp_ports)
+endif()
+set_tests_properties(test_integration test_integration_heavy test_shared PROPERTIES
+    RESOURCE_LOCK rel4u_udp_ports
+)
+get_property(REL4U_TESTS DIRECTORY PROPERTY TESTS)
+set_tests_properties(${REL4U_TESTS} PROPERTIES TIMEOUT 180)
 
 # Examples
 add_executable(server_echo examples/server_echo.c)

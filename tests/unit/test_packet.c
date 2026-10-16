@@ -1,6 +1,9 @@
 #include "../framework/test_framework.h"
 #include "../../src/core/rel4u_packet.h"
+#include "rel4u.h"
 #include <string.h>
+
+#include "../framework/test_resources.h"
 
 static bool test_packet_encode_decode(void) {
     rel4u_header_t hdr;
@@ -90,8 +93,85 @@ static bool test_packet_reset_codec(void) {
     return true;
 }
 
+static bool test_packet_codec_errors(void) {
+    rel4u_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = REL4U_MAGIC;
+    hdr.version = REL4U_VERSION;
+    hdr.packet_type = REL4U_PKT_DATA;
+    hdr.payload_len = 50;
+
+    uint8_t buffer[128];
+    // Encode buffer too small
+    ASSERT_EQ(rel4u_packet_encode_header(&hdr, buffer, REL4U_HEADER_LEN - 1), -1);
+    // NULL encode args
+    ASSERT_EQ(rel4u_packet_encode_header(NULL, buffer, sizeof(buffer)), -1);
+    ASSERT_EQ(rel4u_packet_encode_header(&hdr, NULL, sizeof(buffer)), -1);
+
+    // Encode valid packet
+    ASSERT_EQ(rel4u_packet_encode_header(&hdr, buffer, sizeof(buffer)), REL4U_HEADER_LEN);
+
+    rel4u_header_t decoded;
+    // Decode buffer too small (< REL4U_HEADER_LEN)
+    ASSERT_EQ(rel4u_packet_decode_header(buffer, REL4U_HEADER_LEN - 1, &decoded), -1);
+    // NULL decode args
+    ASSERT_EQ(rel4u_packet_decode_header(NULL, sizeof(buffer), &decoded), -1);
+    ASSERT_EQ(rel4u_packet_decode_header(buffer, sizeof(buffer), NULL), -1);
+
+    // Incomplete payload: declared 50 bytes, but only 20 provided after header
+    ASSERT_EQ(rel4u_packet_decode_header(buffer, REL4U_HEADER_LEN + 20, &decoded), -4);
+
+    // Invalid version
+    hdr.version = 99;
+    rel4u_packet_encode_header(&hdr, buffer, sizeof(buffer));
+    ASSERT_EQ(rel4u_packet_decode_header(buffer, REL4U_HEADER_LEN + 50, &decoded), -3);
+
+    return true;
+}
+
+static bool test_packet_golden_wire_vector(void) {
+    const uint8_t golden_packet[29] = {
+        0x34, 0x55,             // magic = 0x3455 ("4U")
+        0x01,                   // version = 1
+        0x04,                   // packet_type = REL4U_PKT_DATA
+        0x03,                   // delivery_mode = REL4U_MODE_RELIABLE_ORDERED
+        0x01,                   // flags = REL4U_FLAG_ACK_IMMEDIATE
+        0x00, 0x05,             // payload_len = 5
+        0x12, 0x34, 0x56, 0x78, // session_id = 0x12345678
+        0x00, 0x00, 0x00, 0x2A, // seq_num = 42
+        0x00, 0x00, 0x00, 0x28, // ack_num = 40
+        0x00, 0x00, 0x00, 0x05, // sack_mask = 0x00000005
+        'H',  'E',  'L',  'L',  'O'
+    };
+
+    rel4u_header_t decoded;
+    memset(&decoded, 0, sizeof(decoded));
+    int res = rel4u_packet_decode_header(golden_packet, sizeof(golden_packet), &decoded);
+    ASSERT_EQ(res, 0);
+    ASSERT_EQ(decoded.magic, 0x3455);
+    ASSERT_EQ(decoded.version, 1);
+    ASSERT_EQ(decoded.packet_type, REL4U_PKT_DATA);
+    ASSERT_EQ(decoded.delivery_mode, REL4U_MODE_RELIABLE_ORDERED);
+    ASSERT_EQ(decoded.flags, REL4U_FLAG_ACK_IMMEDIATE);
+    ASSERT_EQ(decoded.payload_len, 5);
+    ASSERT_EQ(decoded.session_id, 0x12345678);
+    ASSERT_EQ(decoded.seq_num, 42);
+    ASSERT_EQ(decoded.ack_num, 40);
+    ASSERT_EQ(decoded.sack_mask, 0x00000005);
+
+    uint8_t encoded[64];
+    memset(encoded, 0, sizeof(encoded));
+    int enc_len = rel4u_packet_encode_header(&decoded, encoded, sizeof(encoded));
+    ASSERT_EQ(enc_len, REL4U_HEADER_LEN);
+    ASSERT_EQ(memcmp(encoded, golden_packet, REL4U_HEADER_LEN), 0);
+
+    return true;
+}
+
 TEST_SUITE_BEGIN("Packet Codec Unit Tests")
     RUN_TEST(test_packet_encode_decode);
+    RUN_TEST(test_packet_golden_wire_vector);
     RUN_TEST(test_packet_reset_codec);
     RUN_TEST(test_packet_corrupt_rejection);
+    RUN_TEST(test_packet_codec_errors);
 TEST_SUITE_END()

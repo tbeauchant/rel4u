@@ -39,7 +39,7 @@ bool rel4u_send_window_can_send(const rel4u_send_window_t* win) {
 
 int rel4u_send_window_push(rel4u_send_window_t* win, rel4u_delivery_mode_t mode,
                             const void* data, size_t len, uint64_t now_ns, uint32_t* out_seq) {
-    if (!win || !data || len > REL4U_DEFAULT_MTU) {
+    if (!win || !data || len > REL4U_MAX_PAYLOAD_SIZE) {
         return -1;
     }
 
@@ -348,27 +348,36 @@ int rel4u_recv_window_on_packet(rel4u_recv_window_t* win, const rel4u_header_t* 
         }
 
         /* Drain contiguous in-order packets */
-        size_t ready_count = 0;
-        while (ready_count < max_ready) {
-            uint32_t exp_idx = win->expected_seq & (win->capacity - 1);
-            rel4u_recv_slot_t* exp_slot = &win->slots[exp_idx];
-
-            if (exp_slot->received && exp_slot->seq_num == win->expected_seq) {
-                if (exp_slot->delivery_mode == REL4U_MODE_RELIABLE_ORDERED) {
-                    out_ready_slots[ready_count] = *exp_slot;
-                    ready_count++;
-                }
-                exp_slot->received = false; /* Clear slot */
-                win->expected_seq++;
-            } else {
-                break;
-            }
-        }
-        *out_ready_count = ready_count;
-        return 0;
+        return rel4u_recv_window_pop_ready(win, out_ready_slots, max_ready, out_ready_count);
     }
 
     return -1;
+}
+
+int rel4u_recv_window_pop_ready(rel4u_recv_window_t* win, rel4u_recv_slot_t* out_ready_slots,
+                                size_t max_ready, size_t* out_ready_count) {
+    if (!win || !out_ready_slots || !out_ready_count || max_ready == 0) {
+        return -1;
+    }
+
+    size_t ready_count = 0;
+    while (ready_count < max_ready) {
+        uint32_t exp_idx = win->expected_seq & (win->capacity - 1);
+        rel4u_recv_slot_t* exp_slot = &win->slots[exp_idx];
+
+        if (exp_slot->received && exp_slot->seq_num == win->expected_seq) {
+            if (exp_slot->delivery_mode == REL4U_MODE_RELIABLE_ORDERED) {
+                out_ready_slots[ready_count] = *exp_slot;
+                ready_count++;
+            }
+            exp_slot->received = false; /* Clear slot */
+            win->expected_seq++;
+        } else {
+            break;
+        }
+    }
+    *out_ready_count = ready_count;
+    return 0;
 }
 
 void rel4u_recv_window_get_ack_info(const rel4u_recv_window_t* win, uint32_t* out_ack_num, uint32_t* out_sack_mask) {
